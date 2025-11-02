@@ -1,0 +1,240 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>TFJS + THREE — Learn: Don't Hit the Wall (6 actions)</title>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.160/build/three.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.20.0/dist/tf.min.js"></script>
+  <style>
+    html,body{margin:0;height:100%;overflow:hidden;background:#111;font-family:system-ui,Segoe UI,Arial}
+    #ui{position:fixed;left:10px;top:10px;color:#fff;font:12px/1.4 system-ui;background:#0008;padding:10px 12px;border-radius:10px}
+    button{cursor:pointer}
+    .mono{font-family:ui-monospace,Consolas,Menlo,monospace}
+  </style>
+</head>
+<body>
+<div id="ui">
+  <div><b>Supervised imitation:</b> labels come from a <i>safety rule</i> (“don’t hit the wall”). 6 actions: U,D,L,R,A(-z),B(+z).</div>
+  <div style="margin-top:6px; display:flex; gap:10px; align-items:center;">
+    <button id="trainBtn">Train (one round)</button>
+    <span id="rounds">Rounds: 0</span>
+  </div>
+  <div id="log" class="mono" style="white-space:pre;margin-top:8px;max-width:560px;max-height:260px;overflow:auto;"></div>
+</div>
+
+<script>
+(async function(){
+  // ===== THREE scene =====
+  const scene = new THREE.Scene();
+  scene.add(new THREE.AmbientLight(0xffffff, 0.7));
+  const sun = new THREE.DirectionalLight(0xffffff, 0.8); sun.position.set(6,10,7); scene.add(sun);
+
+  const camera = new THREE.PerspectiveCamera(60, innerWidth/innerHeight, 0.1, 1000);
+  camera.position.set(0, 4, 10);
+
+  const renderer = new THREE.WebGLRenderer({antialias:true});
+  renderer.setSize(innerWidth, innerHeight);
+  document.body.appendChild(renderer.domElement);
+  addEventListener('resize', ()=>{
+    camera.aspect = innerWidth/innerHeight; camera.updateProjectionMatrix();
+    renderer.setSize(innerWidth, innerHeight);
+  });
+
+  // Box 5×5×5 (half=2.5)
+  scene.add(new THREE.GridHelper(8, 16, 0x444444, 0x222222));
+  const BOX_HALF = 2.5;
+  const boxGeo = new THREE.BoxGeometry(BOX_HALF*2, BOX_HALF*2, BOX_HALF*2);
+  const boxEdges = new THREE.LineSegments(new THREE.EdgesGeometry(boxGeo), new THREE.LineBasicMaterial({color:0x666666}));
+  scene.add(boxEdges);
+
+  // Ball (radius ~0.45)
+  const BASE_R=0.5, BALL_SCALE=0.9, BALL_R=BASE_R*BALL_SCALE;
+  const ball = new THREE.Mesh(
+    new THREE.SphereGeometry(BASE_R, 32, 16),
+    new THREE.MeshStandardMaterial({color:0x4fc3f7, roughness:0.6, metalness:0.1})
+  );
+  ball.scale.setScalar(BALL_SCALE);
+  scene.add(ball);
+
+  // ===== Physics & state =====
+  const state = { x: 0, y: 0, z: 0, vx: 0.0, vy: 0.0, vz: 0.0 };
+  const LIM = BOX_HALF - BALL_R;      // inside-wall limit
+  const ACCEL = 1.2;                  // accel magnitude (units/s^2)
+  const VMAX  = 3.0;                  // optional speed cap
+  let lastT = performance.now();
+
+  function clampSpeed(st){
+    const s = Math.hypot(st.vx, st.vy, st.vz);
+    if (s > VMAX){ const k = VMAX/s; st.vx*=k; st.vy*=k; st.vz*=k; }
+  }
+
+  // ===== Model: 6 -> (32,16) -> 6 =====
+  const model = tf.sequential({
+    layers: [
+      tf.layers.dense({inputShape:[6], units:32, activation:'relu'}),
+      tf.layers.dense({units:16, activation:'relu'}),
+      tf.layers.dense({units:6, activation:'softmax'})
+    ]
+  });
+  model.compile({optimizer:'adam', loss:'categoricalCrossentropy'});
+  let trainRounds = 0;
+
+
+  const LABEL_DT = 0.05;   // small, fixed step for labeling
+  function applyActionOnce(s, a, dt){
+    const st = {x:s[0],y:s[1],z:s[2], vx:s[3],vy:s[4],vz:s[5]};
+    const aMag = ACCEL * dt;
+    switch(a){
+      case 0: st.vy += aMag; break; // U (+y)
+      case 1: st.vy -= aMag; break; // D (-y)
+      case 2: st.vx -= aMag; break; // L (-x)
+      case 3: st.vx += aMag; break; // R (+x)
+      case 4: st.vz -= aMag; break; // A (-z)
+      case 5: st.vz += aMag; break; // B (+z)
+    }
+    clampSpeed(st);
+    st.x += st.vx * dt;
+    st.y += st.vy * dt;
+    st.z += st.vz * dt;
+    return st;
+  }
+  function overflowAmt(st){
+    // how far outside the box (0 means inside)
+    const ox = Math.max(0, Math.abs(st.x) - LIM);
+    const oy = Math.max(0, Math.abs(st.y) - LIM);
+    const oz = Math.max(0, Math.abs(st.z) - LIM);
+    return ox + oy + oz;
+  }
+  function labelBySafety(s){
+    // Try all 6 actions; collect those that keep ball inside
+    let bestA = 0, bestOverflow = Infinity, safeChoices = [];
+    for(let a=0;a<6;a++){
+      const st = applyActionOnce(s, a, LABEL_DT);
+      const ov = overflowAmt(st);
+      if (ov === 0){
+        safeChoices.push({a, st});
+      }
+      if (ov < bestOverflow){ bestOverflow = ov; bestA = a; }
+    }
+    if (safeChoices.length){
+      // tie-breaker: prefer action that moves toward center (smaller |pos| sum)
+      safeChoices.sort((p,q)=>{
+        const sp = Math.abs(p.st.x)+Math.abs(p.st.y)+Math.abs(p.st.z);
+        const sq = Math.abs(q.st.x)+Math.abs(q.st.y)+Math.abs(q.st.z);
+        return sp - sq;
+      });
+      return safeChoices[0].a;
+    } else {
+      return bestA;
+    }
+  }
+
+  // ===== Dataset =====
+  function randRange(a,b){ return a + Math.random()*(b-a); }
+  function sampleState(){
+    const x = randRange(-LIM, LIM);
+    const y = randRange(-LIM, LIM);
+    const z = randRange(-LIM, LIM);
+    const vx= randRange(-1.5, 1.5);
+    const vy= randRange(-1.5, 1.5);
+    const vz= randRange(-1.5, 1.5);
+    return [x,y,z,vx,vy,vz];
+  }
+  function makeDataset(N){
+    const X = new Float32Array(N*6);
+    const y = new Int32Array(N);
+    for(let i=0;i<N;i++){
+      const s = sampleState();
+      for(let k=0;k<6;k++) X[i*6+k]=s[k];
+      y[i] = labelBySafety(s);
+    }
+    return {X,y};
+  }
+
+  // ===== Train =====
+  async function trainOneRound(){
+    log('Generating dataset with SAFETY labels (don’t hit wall)…');
+    const {X,y} = makeDataset(800);
+
+    const xs = tf.tensor2d(X, [y.length,6]);
+    const ys = tf.oneHot(tf.tensor1d(y, 'int32'), 6);
+
+    log('Training (supervised imitation of safety)…');
+    await model.fit(xs, ys, {
+      epochs: 15,
+      batchSize: 128,
+      callbacks: { onEpochEnd: (e,l)=>log(`  epoch ${e+1}/15  loss=${l.loss.toFixed(4)}`) }
+    });
+
+    xs.dispose(); ys.dispose();
+    trainRounds += 1; setRounds(trainRounds);
+    log(`Round ${trainRounds} complete.\n`);
+  }
+
+  // ===== argmax =====
+  function nnActionArgmax(sArr){
+    return tf.tidy(() =>
+      (model.predict(tf.tensor2d([sArr]))   // [1,6]
+       .argMax(-1)                          // [1]
+       .dataSync()[0]) | 0
+    );
+  }
+
+  function applyAction(a, dt){
+    const aMag = ACCEL * dt;
+    switch(a){
+      case 0: state.vy += aMag; break; // U
+      case 1: state.vy -= aMag; break; // D
+      case 2: state.vx -= aMag; break; // L
+      case 3: state.vx += aMag; break; // R
+      case 4: state.vz -= aMag; break; // A 
+      case 5: state.vz += aMag; break; // B 
+    }
+  }
+  function keepInsideClampStop(){
+    if (state.x >  LIM){ state.x =  LIM - 1e-6; state.vx = 0; log("hit");}
+    if (state.x < -LIM){ state.x = -LIM + 1e-6; state.vx = 0; log("hit");}
+    if (state.y >  LIM){ state.y =  LIM - 1e-6; state.vy = 0; log("hit");}
+    if (state.y < -LIM){ state.y = -LIM + 1e-6; state.vy = 0; log("hit");}
+    if (state.z >  LIM){ state.z =  LIM - 1e-6; state.vz = 0; log("hit");}
+    if (state.z < -LIM){ state.z = -LIM + 1e-6; state.vz = 0; log("hit");}
+  }
+
+  function step(dt){
+    const s=[state.x,state.y,state.z,state.vx,state.vy,state.vz];
+    const a = nnActionArgmax(s);
+    applyAction(a, dt);
+
+    state.x += state.vx * dt;
+    state.y += state.vy * dt;
+    state.z += state.vz * dt;
+
+    
+
+    clampSpeed(state);
+    keepInsideClampStop();   
+    ball.position.set(state.x,state.y,state.z);
+  }
+
+  function animate(tNow){
+    requestAnimationFrame(animate);
+    const dt = Math.min(0.033, (tNow - lastT) / 1000);
+    lastT = tNow;
+    const sub = 2, dts = dt/sub;
+    for(let i=0;i<sub;i++) step(dts);
+    renderer.render(scene, camera);
+  }
+  requestAnimationFrame((t)=>{ lastT=t; animate(t); });
+
+  // ===== UI / log =====
+  const logEl = document.getElementById('log');
+  function log(...a){ logEl.textContent += a.join(' ')+'\n'; logEl.scrollTop = logEl.scrollHeight; }
+  function setRounds(n){ document.getElementById('rounds').textContent = `Rounds: ${n}`; }
+  document.getElementById('trainBtn').onclick = trainOneRound;
+
+  log('NN controls the ball. Labels are generated by a SAFETY rule: pick actions whose next step stays inside the box.');
+  setRounds(0);
+})();
+</script>
+</body>
+</html>
